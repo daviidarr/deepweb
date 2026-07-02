@@ -1,6 +1,6 @@
 ---
 name: deepweb
-version: 2.0.0
+version: 2.1.0
 description: Navigate login-walled websites with your real authenticated MCP Playwright session. Fan out across sites sequentially, compare results in a table, open checkout tabs ready to buy.
 triggers:
   - deepweb
@@ -101,9 +101,19 @@ Each iteration:
 When a login wall is detected:
 
 1. Extract domain from current URL.
-2. Lookup credentials in Chrome Password Manager:
+2. **Lookup credentials — try `passwords.json` first, Chrome as fallback:**
 
 ```bash
+# Step 1: fast lookup from local passwords store (946 entries, no decryption needed)
+DOMAIN="example.com"
+CREDS=$(python3 ~/.claude/scripts/pw-lookup.py "$DOMAIN" 2>/dev/null)
+if [ -n "$CREDS" ]; then
+    _USER=$(echo "$CREDS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('username',''))")
+    _PASS=$(echo "$CREDS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('password',''))")
+fi
+
+# Step 2: fallback to Chrome encrypted Login Data if not found above
+if [ -z "$_USER" ]; then
 python3 - <<'PYEOF'
 import subprocess, hashlib, sqlite3, shutil, os, sys, tempfile
 
@@ -150,6 +160,7 @@ finally:
     try: os.unlink(tmp_db)
     except OSError: pass
 PYEOF
+fi
 ```
 
 3. If credentials found:
@@ -235,5 +246,47 @@ All tabs are open. Click the confirm button in the tab of your choice.
 
 - **Why only MCP Playwright**: the session is already authenticated with real cookies and fingerprint. $B and WebFetch are unauthenticated headless sessions — they get 403'd by French retail (Fnac, Darty, BHV, Boulanger, Cdiscount all block them). MCP Playwright has zero 403 risk for sites where you're already logged in.
 - **Sequential is fine**: each site navigation takes 5–15 seconds. 6 sites = ~60–90 seconds total. The old parallel bash approach was slower in practice because of subprocess startup, `claude -p` JSON marshaling, and 403 failures requiring retries.
-- **Chrome Password Manager**: handles auto-login for sites not yet authenticated in the session. Tested on Amazon.fr (multi-step + WhatsApp 2FA), Cdiscount (single-step).
+- **Credential lookup order**: `~/.claude/scripts/passwords.json` (946 entries, instant, no keyring) → Chrome encrypted Login Data (requires `secret-tool` + AES decryption). Always try `pw-lookup.py` first — financial domains are excluded from the store by policy so Chrome fallback matters for those.
 - **Tab management**: each site gets its own tab. After Step 2, all result tabs are open. Step 4 navigates them to checkout.
+
+## Data extraction with `browser_evaluate` + `filename`
+
+For pages where you need to extract structured data (URLs, prices, IDs) from JS state rather than the accessibility tree, use `browser_evaluate` with the `filename` parameter to save directly to disk:
+
+```javascript
+// Example: extract all signed CDN image URLs from a lazy-loaded carousel
+const urls = [...document.querySelectorAll('img')]
+  .map(i => i.src)
+  .filter(s => s.includes('cloudfront.net'));
+JSON.stringify({ count: urls.length, urls });
+```
+
+Call with `filename: "/home/<user>/Downloads/output.json"` (must be under `~/` — paths under `/tmp` are outside allowed roots and will fail).
+
+**Important**: the result is doubly-encoded — `browser_evaluate` wraps the JS return value in an outer JSON string. Parse with:
+
+```python
+import json
+raw = open('output.json').read()
+data = json.loads(json.loads(raw))   # two loads: outer string → inner object
+```
+
+**Lazy-loading pattern**: many SPAs (DocSend, etc.) only render visible elements. Scroll the container before extracting:
+
+```javascript
+// Scroll to trigger lazy loading, then extract
+const container = document.querySelector('.carousel.js-viewer');
+const total = container.scrollHeight;
+const step = 900;
+let pos = 0;
+await new Promise(resolve => {
+  const scroll = () => {
+    container.scrollTop = pos; pos += step;
+    if (pos < total) setTimeout(scroll, 150);
+    else { container.scrollTop = total; setTimeout(() => resolve(), 1000); }
+  };
+  scroll();
+});
+// now extract — all pages are loaded
+[...document.querySelectorAll('img')].map(i => i.src).filter(s => s.includes('cloudfront.net'));
+```
